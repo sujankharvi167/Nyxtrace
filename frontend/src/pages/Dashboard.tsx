@@ -135,7 +135,7 @@ export const Dashboard: React.FC = () => {
         <StatCard
           label="Transactions Analyzed"
           value={loading ? '—' : formatNumber(stats?.total_transactions_analyzed)}
-          subtext="Upload a dataset to begin"
+          subtext={stats?.total_transactions_analyzed != null ? 'From uploaded dataset' : 'Upload a dataset to begin'}
           icon={<TrendingUp className="w-4 h-4" />}
         />
         <StatCard

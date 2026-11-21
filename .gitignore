@@ -41,6 +41,7 @@ logs/
 
 # Data files (large datasets — do not commit)
 *.csv
+backend/data/
 !tests/fixtures/*.csv
 
 # Coverage
