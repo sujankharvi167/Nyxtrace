@@ -1,0 +1,53 @@
+# Dependencies
+node_modules/
+frontend/node_modules/
+
+# Build outputs
+frontend/dist/
+frontend/.vite/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+backend/.venv/
+backend/venv/
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Environment files
+.env
+backend/.env
+frontend/.env
+!backend/.env.example
+!frontend/.env.example
+
+# IDE
+.vscode/settings.json
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Data files (large datasets — do not commit)
+*.csv
+!tests/fixtures/*.csv
+
+# Coverage
+coverage/
+.coverage
+htmlcov/
+
+# Temporary
+tmp/
+scratch/
