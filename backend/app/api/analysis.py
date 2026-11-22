@@ -5,6 +5,7 @@ from app.core.logging import logger
 from app.services.dataset_processor import load_latest_dataset, process_uploads
 from app.services.ml_engine import ml_engine
 from pathlib import Path
+import sqlite3
 
 router = APIRouter(prefix="/analysis", tags=["Analysis"])
 BACKEND_DIR = Path(__file__).resolve().parents[2]
@@ -16,6 +17,19 @@ async def get_platform_stats():
     logger.info("Platform stats requested")
     dataset = load_latest_dataset(BACKEND_DIR)
     if dataset:
+        active_investigations = 0
+        case_db = BACKEND_DIR / "data" / "investigations.sqlite3"
+        if case_db.is_file():
+            try:
+                with sqlite3.connect(case_db) as connection:
+                    active_investigations = int(connection.execute(
+                        """
+                        SELECT COUNT(*) FROM investigation_cases
+                        WHERE status IN ('open', 'under_review', 'escalated')
+                        """
+                    ).fetchone()[0])
+            except sqlite3.Error:
+                active_investigations = 0
         suspicious_count = (
             int(ml_engine.summary()["suspicious_count"])
             if ml_engine.has_current_results()
@@ -25,7 +39,7 @@ async def get_platform_stats():
             total_transactions_analyzed=int(dataset["total_transactions"]),
             suspicious_transactions_detected=suspicious_count,
             accounts_flagged=None,
-            active_investigations=0,
+            active_investigations=active_investigations,
             last_analysis_at=dataset["uploaded_at"],
             platform_status="ready",
         )

@@ -189,9 +189,10 @@ Run the backend tests from `backend/` with `python -m unittest discover -s tests
 |---------|------|-------------|-------|
 | Dashboard | `/` | Platform overview and investigation workflow | ✅ Stage 1 |
 | Transaction Analysis | `/analysis` | Dataset upload, preprocessing, and model workflow | ✅ Stages 2–3 |
-| Money Flow Intelligence | `/money-flow` | Transaction network analysis and route tracing | 🔲 Stage 4 |
-| Risk Intelligence | `/risk` | Later risk insights and investigation workflow | 🔲 Later stages |
-| Investigation Reports | `/reports` | Analysis summaries and downloadable reports | 🔲 Stage 5 |
+| Money Flow Intelligence | `/money-flow` | Transaction network analysis and route tracing | ✅ Stage 4 |
+| Risk Intelligence | `/risk` | ML/graph investigation risk and analytics | ✅ Stage 5 |
+| Investigation Cases | `/cases` | Persistent investigation cases, notes, and history | ✅ Stage 5 |
+| Investigation Reports | `/reports` | PDF reports and compliance-preparation exports | ✅ Stage 6 |
 | About NyxTrace | `/about` | Platform overview, tech stack, and roadmap | ✅ Stage 1 |
 
 ---
@@ -218,6 +219,10 @@ Synthetic banking-style AML transaction data for realistic banking scenarios.
 - **Dataset CSV files** are excluded from version control (see `.gitignore`) due to their size.
 - Backend and frontend are independently deployable services.
 - CORS is configured for local development; update `ALLOWED_ORIGINS` in `.env` for production.
+- Set `VITE_API_BASE_URL` in the frontend deployment environment to the public backend URL.
+- Render: use `render.yaml`; mount persistent storage at `/opt/render/project/src/backend/data` for datasets, models, SQLite databases, graph artifacts, and reports.
+- Vercel: deploy the `frontend/` directory and set `VITE_API_BASE_URL` to the public Render backend URL.
+- Local development continues to use the Vite proxy on port 8001.
 - Do not commit or push without explicit instruction.
 
 ---

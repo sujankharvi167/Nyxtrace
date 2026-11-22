@@ -16,7 +16,7 @@ const TECH_STACK = [
   {
     category: 'Machine Learning',
     color: '#fbbf24',
-    items: ['Scikit-learn 1.5 (Stage 3)', 'XGBoost (Stage 3)', 'SHAP Explainability (Stage 3)', 'NetworkX 3.4 (Stage 4)'],
+    items: ['Scikit-learn 1.5', 'Logistic Regression', 'Random Forest', 'Feature-ablation explanations', 'NetworkX 3.4'],
   },
   {
     category: 'Deployment',
@@ -26,21 +26,21 @@ const TECH_STACK = [
 ];
 
 const CAPABILITIES = [
-  { label: 'ML-Based Detection',      desc: 'XGBoost transaction-level suspicious activity classification.',              stage: 3 },
+  { label: 'ML-Based Detection',      desc: 'Logistic Regression and Random Forest suspicious-activity classification.', stage: 3 },
   { label: 'Graph Analytics',         desc: 'NetworkX-powered transaction network construction and community detection.', stage: 4 },
-  { label: 'Money-Flow Route Tracing',desc: 'Path identification across intermediary accounts.',                          stage: 4 },
-  { label: 'AML Pattern Detection',   desc: 'Layering, fan-in/out, cyclic, and high-velocity pattern detection.',        stage: 4 },
-  { label: 'Risk Scoring',            desc: 'Quantitative suspicion scoring with SHAP explainability.',                  stage: 3 },
-  { label: 'Investigation Reports',   desc: 'Downloadable investigation summaries and compliance-ready exports.',         stage: 5 },
+  { label: 'Money-Flow Route Tracing',desc: 'Shortest-path and upstream/downstream transaction relationship tracing.', stage: 4 },
+  { label: 'Graph Pattern Detection',  desc: 'Fan-in, fan-out, bounded cycles, and suspicious-cluster indicators.',       stage: 4 },
+  { label: 'Risk Scoring',            desc: 'Transparent investigation-risk scoring with ML and graph evidence.',        stage: 5 },
+  { label: 'Investigation Reports',   desc: 'Downloadable investigation summaries and compliance-preparation exports.',  stage: 6 },
 ];
 
 const ROADMAP = [
   { stage: 1, label: 'Project Foundation',         desc: 'Architecture, design system, navigation, frontend-backend connectivity.',               current: true  },
   { stage: 2, label: 'Dataset Processing',         desc: 'CSV upload, validation, cleaning, feature preprocessing, dataset statistics.',           current: false },
-  { stage: 3, label: 'Machine Learning',           desc: 'Model training, suspicious classification, risk scoring, SHAP explainability.',          current: false },
+  { stage: 3, label: 'Machine Learning',           desc: 'Model training, evaluation, predictions, and feature-ablation explanations.',             current: false },
   { stage: 4, label: 'Graph Intelligence',         desc: 'NetworkX graph, route tracing, pattern detection, React Flow visualisation.',            current: false },
-  { stage: 5, label: 'Investigation Intelligence', desc: 'Investigation summaries, risk insights, downloadable reports, dashboard integration.',   current: false },
-  { stage: 6, label: 'Finalisation',               desc: 'Testing, optimisation, security review, CI/CD, deployment preparation.',                 current: false },
+  { stage: 5, label: 'Risk and Investigation',     desc: 'Investigation risk scoring, case management, notes, and activity history.',               current: false },
+  { stage: 6, label: 'Investigation Reports',      desc: 'PDF report generation, persistence, downloads, and evidence exports.',                   current: false },
 ];
 
 export const About: React.FC = () => (

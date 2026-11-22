@@ -16,7 +16,7 @@ import {
 import { cn } from '@/utils';
 import { StatusBadge } from '@/components/ui';
 import { api } from '@/services/api';
-import type { GraphStatus, MLStatus } from '@/types';
+import type { GraphStatus, MLStatus, RiskReadiness } from '@/types';
 
 const NAV_ITEMS = [
   { label: 'Dashboard',            path: '/',           icon: LayoutDashboard },
@@ -37,26 +37,30 @@ export const AppLayout: React.FC<AppLayoutProps> = ({ children }) => {
   const [collapsed, setCollapsed] = useState(false);
   const [mlStatus, setMlStatus] = useState<MLStatus | null>(null);
   const [graphStatus, setGraphStatus] = useState<GraphStatus | null>(null);
+  const [riskStatus, setRiskStatus] = useState<RiskReadiness | null>(null);
   const [backendAvailable, setBackendAvailable] = useState(false);
 
   useEffect(() => {
     let active = true;
     const refresh = async () => {
       try {
-        const [health, ml, graph] = await Promise.all([
+        const [health, ml, graph, risk] = await Promise.all([
           api.health.check(),
           api.ml.status(),
           api.graph.status(),
+          api.risk.readiness().catch(() => null),
         ]);
         if (!active) return;
         setBackendAvailable(Boolean(health));
         setMlStatus(ml.data ?? null);
         setGraphStatus(graph.data ?? null);
+        setRiskStatus(risk?.data ?? null);
       } catch {
         if (active) {
           setBackendAvailable(false);
           setMlStatus(null);
           setGraphStatus(null);
+          setRiskStatus(null);
         }
       }
     };

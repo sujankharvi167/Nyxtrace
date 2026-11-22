@@ -120,7 +120,7 @@ class ReportEngine:
                 ml_results = ml_engine.evaluation()
                 model_batch = str(ml_results["dataset"]["batch_id"])
                 prediction_batch = model_batch
-            except HTTPException:
+            except HTTPException as exc:
                 pass
         graph_batch = graph_status.get("dataset_batch")
         return {
@@ -227,7 +227,7 @@ class ReportEngine:
                     sort_by="risk_score",
                     sort_order="desc",
                 )
-            except HTTPException:
+            except HTTPException as exc:
                 data["risk_distribution"] = {
                     "total_assessed": 0,
                     "unassessed": 0,
@@ -671,7 +671,7 @@ class ReportEngine:
         def page_number(canvas, doc):
             canvas.saveState()
             canvas.setFont("Helvetica", 8)
-            canvas.drawRightString(A4[0] - 36, 24, f"NyxTrace · Page {doc.page}")
+            canvas.drawRightString(A4[0] - 36, 24, f"NyxTrace - Page {doc.page}")
             canvas.restoreState()
 
         output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -768,14 +768,24 @@ class ReportEngine:
                         metadata_json = ?
                     WHERE report_id = ?
                     """,
-                    (json.dumps(metadata, default=str), report_id),
+                    (
+                        json.dumps(
+                            {
+                                "transaction_ids": normalized_transaction_ids,
+                                "compatibility": compatibility,
+                            },
+                            default=str,
+                        ),
+                        report_id,
+                    ),
                 )
                 connection.commit()
-        except HTTPException:
+        except HTTPException as exc:
+            file_path.unlink(missing_ok=True)
             with closing(self._connect()) as connection:
                 connection.execute(
                     "UPDATE reports SET status = 'failed', error_message = ? WHERE report_id = ?",
-                    ("Report generation could not be completed.", report_id),
+                    (str(getattr(exc, "detail", "Report generation could not be completed.")), report_id),
                 )
                 connection.commit()
             raise

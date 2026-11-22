@@ -16,7 +16,7 @@ import { MLDashboardOverview } from '@/components/MLDashboardOverview';
 import { useApi } from '@/hooks/useApi';
 import { api } from '@/services/api';
 import { formatNumber } from '@/utils';
-import type { GraphStatistics, GraphStatus, MLStatus, PlatformStats } from '@/types';
+import type { GraphStatistics, GraphStatus, MLStatus, PlatformStats, RiskReadiness } from '@/types';
 
 /* ── Workflow step ─────────────────────────────────────────────── */
 interface WorkflowStepProps {
@@ -108,9 +108,13 @@ export const Dashboard: React.FC = () => {
   const { data: mlStatusResponse } = useApi(
     () => api.ml.status(),
   );
+  const { data: riskStatusResponse } = useApi(
+    () => api.risk.readiness(),
+  );
   const graphStatus = (graphStatusResponse as { data?: GraphStatus } | null)?.data ?? null;
   const graphStats = (graphStatsResponse as { data?: GraphStatistics } | null)?.data ?? null;
   const mlStatus = (mlStatusResponse as { data?: MLStatus } | null)?.data ?? null;
+  const riskStatus = (riskStatusResponse as { data?: RiskReadiness } | null)?.data ?? null;
 
   return (
     <div className="space-y-6">
@@ -189,9 +193,9 @@ export const Dashboard: React.FC = () => {
             <div className="ml-3.5 w-px h-3" style={{ backgroundColor: '#263354' }} />
             <WorkflowStep number={4} label="Graph Intelligence"  description="Transaction network construction and analysis"     status={graphStatus?.status === 'ready' ? 'complete' : datasetLoaded ? 'active' : 'pending'} />
             <div className="ml-3.5 w-px h-3" style={{ backgroundColor: '#263354' }} />
-            <WorkflowStep number={5} label="Risk Analysis"       description="Risk scoring and pattern identification"           status="pending" />
+            <WorkflowStep number={5} label="Risk Analysis"       description="Risk scoring and pattern identification"           status={riskStatus?.compatible ? 'complete' : graphStatus?.status === 'ready' ? 'active' : 'pending'} />
             <div className="ml-3.5 w-px h-3" style={{ backgroundColor: '#263354' }} />
-            <WorkflowStep number={6} label="Investigation Report" description="Summary and downloadable report generation"       status="pending" />
+            <WorkflowStep number={6} label="Investigation Report" description="Summary and downloadable report generation"       status={riskStatus?.compatible ? 'active' : 'pending'} />
           </div>
         </div>
 

@@ -781,7 +781,12 @@ class MLEngine:
 
         best_model_name = max(
             model_results,
-            key=lambda name: (model_results[name]["f1"], model_results[name]["pr_auc"]),
+            key=lambda name: (
+                model_results[name]["f1"],
+                model_results[name]["pr_auc"]
+                if isinstance(model_results[name]["pr_auc"], (int, float))
+                else -1.0,
+            ),
         )
         best_model = estimators[best_model_name]
         metadata = {
