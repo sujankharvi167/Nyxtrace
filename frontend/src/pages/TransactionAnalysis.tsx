@@ -1,4 +1,4 @@
-import React, { Suspense, lazy, useCallback, useEffect, useState } from 'react';
+import React, { Suspense, lazy, useCallback, useEffect, useRef, useState } from 'react';
 import { Upload, FileText, Database, Info, CheckCircle2, AlertCircle, Loader2 } from 'lucide-react';
 import { SectionHeader, EmptyState } from '@/components/ui';
 import { api } from '@/services/api';
@@ -11,6 +11,7 @@ const MLIntelligencePanel = lazy(() =>
 );
 
 type UploadState = 'idle' | 'hovering' | 'selected';
+type UploadPhase = 'uploading' | 'processing' | 'complete' | null;
 const MAX_FILE_SIZE_BYTES = 750 * 1024 * 1024;
 const MAX_TOTAL_SIZE_BYTES = 800 * 1024 * 1024;
 const MAX_FILES = 3;
@@ -46,6 +47,10 @@ const CONFIG_ROWS = [
 ];
 
 function validateSelectedFiles(files: File[]): string | null {
+  const unsupported = files.find(file => !file.name.toLowerCase().endsWith('.csv'));
+  if (unsupported) {
+    return `${unsupported.name} is not a CSV file. No selected files were uploaded.`;
+  }
   if (files.length > MAX_FILES) {
     return `A maximum of ${MAX_FILES} CSV files is allowed.`;
   }
@@ -66,18 +71,27 @@ export const TransactionAnalysis: React.FC = () => {
   const [dataset, setDataset] = useState<ProcessedDataset | null>(null);
   const [progress, setProgress] = useState(0);
   const [uploading, setUploading] = useState(false);
+  const [uploadPhase, setUploadPhase] = useState<UploadPhase>(null);
+  const [datasetLoading, setDatasetLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const uploadController = useRef<AbortController | null>(null);
 
   useEffect(() => {
+    let active = true;
     api.analysis.getDataset().then((response) => {
       const result = response as APIResponse<ProcessedDataset>;
-      if (result.data) setDataset(result.data);
-    }).catch(() => undefined);
+      if (active && result.data) setDataset(result.data);
+    }).catch((err: unknown) => {
+      if (active) setError(err instanceof Error ? err.message : 'Could not load the saved dataset status.');
+    }).finally(() => {
+      if (active) setDatasetLoading(false);
+    });
+    return () => { active = false; };
   }, []);
 
   const handleDrop = useCallback((e: React.DragEvent) => {
     e.preventDefault();
-    const files = Array.from(e.dataTransfer.files).filter(file => file.name.toLowerCase().endsWith('.csv'));
+    const files = Array.from(e.dataTransfer.files);
     if (files.length) {
       const validationError = validateSelectedFiles(files);
       if (validationError) {
@@ -96,7 +110,7 @@ export const TransactionAnalysis: React.FC = () => {
   }, []);
 
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const files = Array.from(e.target.files ?? []).filter(file => file.name.toLowerCase().endsWith('.csv'));
+    const files = Array.from(e.target.files ?? []);
     if (files.length) {
       const validationError = validateSelectedFiles(files);
       if (validationError) {
@@ -108,7 +122,11 @@ export const TransactionAnalysis: React.FC = () => {
         setUploadState('selected');
         setError(null);
       }
+    } else {
+      setSelectedFiles([]);
+      setUploadState('idle');
     }
+    e.currentTarget.value = '';
   };
 
   const handleUpload = async () => {
@@ -120,14 +138,27 @@ export const TransactionAnalysis: React.FC = () => {
     }
     setUploading(true);
     setProgress(0);
+    setUploadPhase('uploading');
     setError(null);
+    const controller = new AbortController();
+    uploadController.current = controller;
     try {
-      const response = await api.analysis.uploadDataset(selectedFiles, setProgress) as APIResponse<ProcessedDataset>;
-      if (response.data) setDataset(response.data);
+      const response = await api.analysis.uploadDataset(
+        selectedFiles,
+        setProgress,
+        setUploadPhase,
+        controller.signal,
+      ) as APIResponse<ProcessedDataset>;
+      if (response.data) {
+        setDataset(response.data);
+        window.dispatchEvent(new Event('nyxtrace:dataset-updated'));
+      }
       setUploadState('selected');
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Dataset upload failed.');
+      setUploadPhase(null);
     } finally {
+      uploadController.current = null;
       setUploading(false);
     }
   };
@@ -185,8 +216,18 @@ export const TransactionAnalysis: React.FC = () => {
                         <div className="h-full bg-blue-500 transition-all" style={{ width: `${progress}%` }} />
                       </div>
                       <p className="text-xs text-blue-400 mt-2 flex items-center justify-center gap-1.5">
-                        <Loader2 className="w-3 h-3 animate-spin" /> Processing {progress}%
+                        <Loader2 className="w-3 h-3 animate-spin" />
+                        {uploadPhase === 'processing'
+                          ? 'Upload complete · validating and processing on server'
+                          : `Uploading request data ${progress}%`}
                       </p>
+                      <button
+                        type="button"
+                        onClick={() => uploadController.current?.abort()}
+                        className="text-xs text-red-300 hover:text-red-200 underline mt-2"
+                      >
+                        Cancel upload
+                      </button>
                     </div>
                   ) : (
                     <button onClick={handleUpload} className="btn-primary mx-auto">
@@ -195,7 +236,7 @@ export const TransactionAnalysis: React.FC = () => {
                     </button>
                   )}
                   <button
-                    onClick={() => { setSelectedFiles([]); setUploadState('idle'); setProgress(0); }}
+                    onClick={() => { setSelectedFiles([]); setUploadState('idle'); setProgress(0); setUploadPhase(null); setError(null); }}
                     className="text-xs text-slate-500 hover:text-slate-300 underline"
                     disabled={uploading}
                   >
@@ -232,8 +273,8 @@ export const TransactionAnalysis: React.FC = () => {
             {!dataset ? (
               <EmptyState
                 icon={<Database className="w-6 h-6" />}
-                title="No Dataset Loaded"
-                description="Upload a CSV file to view row count, column names, data types, and missing-value statistics."
+                title={datasetLoading ? 'Loading Dataset Status' : 'No Dataset Loaded'}
+                description={datasetLoading ? 'Checking for a previously uploaded dataset.' : 'Upload CSV files to view row count, column names, data types, and missing-value statistics.'}
               />
             ) : (
               <div className="space-y-4">

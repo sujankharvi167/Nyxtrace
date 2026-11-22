@@ -1,6 +1,10 @@
+import asyncio
 import json
+import os
 import re
 import shutil
+import tempfile
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
@@ -15,6 +19,7 @@ MAX_FILES = 3
 ALLOWED_SUFFIX = ".csv"
 CSV_CHUNK_SIZE = 100_000
 STREAM_CHUNK_SIZE = 1024 * 1024
+MINIMUM_UPLOAD_DISK_RESERVE_BYTES = 100 * 1024 * 1024
 
 
 def _normalized(value: str) -> str:
@@ -31,6 +36,27 @@ def _find_column(columns: Iterable[str], candidates: Iterable[str]) -> Optional[
         if any(candidate in name for candidate in candidates):
             return column
     return None
+
+
+def _write_json_atomically(path: Path, payload: Dict[str, object]) -> None:
+    temporary_path = path.with_suffix(path.suffix + f".{uuid.uuid4().hex}.tmp")
+    try:
+        temporary_path.write_text(
+            json.dumps(payload, indent=2, default=str),
+            encoding="utf-8",
+        )
+        os.replace(temporary_path, path)
+    except OSError as exc:
+        temporary_path.unlink(missing_ok=True)
+        if exc.errno == 28 or getattr(exc, "winerror", None) == 112:
+            raise HTTPException(
+                status_code=507,
+                detail="Insufficient disk space while saving the dataset manifest.",
+            ) from exc
+        raise HTTPException(
+            status_code=500,
+            detail=f"Could not persist the dataset manifest: {exc.strerror or exc}.",
+        ) from exc
 
 
 def detect_file_role(filename: str) -> str:
@@ -182,11 +208,18 @@ async def _stream_upload(upload: UploadFile, destination: Path) -> int:
     except OSError as exc:
         if destination.exists():
             destination.unlink(missing_ok=True)
-        if exc.errno in (28, 112):
+        if exc.errno == 28 or getattr(exc, "winerror", None) == 112:
             raise HTTPException(
                 status_code=507,
                 detail="Insufficient disk space while saving the uploaded CSV.",
             ) from exc
+        raise HTTPException(
+            status_code=500,
+            detail=f"Could not save uploaded file {destination.name}: {exc.strerror or exc}.",
+        ) from exc
+    except BaseException:
+        if destination.exists():
+            destination.unlink(missing_ok=True)
         raise
 
     if written == 0:
@@ -198,8 +231,11 @@ async def _stream_upload(upload: UploadFile, destination: Path) -> int:
 def _disk_space_error(backend_dir: Path, required_bytes: int) -> Optional[HTTPException]:
     try:
         free_bytes = shutil.disk_usage(backend_dir).free
-    except OSError:
-        return None
+    except OSError as exc:
+        return HTTPException(
+            status_code=500,
+            detail=f"Could not verify available upload storage at {backend_dir}: {exc}.",
+        )
     if free_bytes < required_bytes:
         return HTTPException(
             status_code=507,
@@ -294,12 +330,15 @@ def _process_csv_in_chunks(
         except (pd.errors.ParserError, UnicodeDecodeError) as exc:
             errors.append(f"Could not parse CSV: {exc}")
         except OSError as exc:
-            if exc.errno in (28, 112):
+            if exc.errno == 28 or getattr(exc, "winerror", None) == 112:
                 raise HTTPException(
                     status_code=507,
                     detail="Insufficient disk space while preprocessing the uploaded CSV.",
                 ) from exc
-            raise
+            raise HTTPException(
+                status_code=500,
+                detail=f"Could not write the processed CSV {processed_path.name}: {exc.strerror or exc}.",
+            ) from exc
 
         if first_chunk:
             errors.append("The CSV contains no data rows.")
@@ -333,10 +372,17 @@ async def process_uploads(
         )
 
     announced_total = 0
+    filenames: set[str] = set()
     for upload in uploads:
         filename = Path(upload.filename or "unnamed.csv").name
         if not filename.lower().endswith(ALLOWED_SUFFIX):
             raise HTTPException(status_code=422, detail=f"{filename}: only .csv files are accepted.")
+        if filename.casefold() in filenames:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Multiple uploaded files use the same filename: {filename}.",
+            )
+        filenames.add(filename.casefold())
         announced_size = getattr(upload, "size", None)
         if isinstance(announced_size, int):
             if announced_size > MAX_FILE_SIZE_BYTES:
@@ -352,13 +398,20 @@ async def process_uploads(
             detail="The combined upload exceeds the 800 MB total size limit.",
         )
 
-    estimated_disk_usage = max(
-        announced_total * 2,
-        100 * 1024 * 1024,
+    estimated_backend_usage = max(
+        announced_total * 2 + MINIMUM_UPLOAD_DISK_RESERVE_BYTES,
+        MINIMUM_UPLOAD_DISK_RESERVE_BYTES,
     )
-    disk_error = _disk_space_error(backend_dir, estimated_disk_usage)
+    disk_error = _disk_space_error(backend_dir, estimated_backend_usage)
     if disk_error:
         raise disk_error
+    estimated_temp_usage = max(announced_total, MINIMUM_UPLOAD_DISK_RESERVE_BYTES)
+    temp_disk_error = _disk_space_error(
+        Path(tempfile.gettempdir()),
+        estimated_temp_usage,
+    )
+    if temp_disk_error:
+        raise temp_disk_error
 
     upload_dir = backend_dir / "data" / "uploads"
     processed_dir = backend_dir / "data" / "processed"
@@ -366,7 +419,7 @@ async def process_uploads(
     processed_dir.mkdir(parents=True, exist_ok=True)
 
     timestamp = datetime.now(timezone.utc)
-    batch_id = timestamp.strftime("%Y%m%d-%H%M%S")
+    batch_id = f"{timestamp.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}"
     batch_upload_dir = upload_dir / batch_id
     batch_processed_dir = processed_dir / batch_id
     batch_upload_dir.mkdir(parents=True)
@@ -387,16 +440,29 @@ async def process_uploads(
         source_path = batch_upload_dir / filename
         try:
             written = await _stream_upload(upload, source_path)
+        except asyncio.CancelledError:
+            shutil.rmtree(batch_upload_dir, ignore_errors=True)
+            shutil.rmtree(batch_processed_dir, ignore_errors=True)
+            raise
         except HTTPException as exc:
+            if exc.status_code != 422:
+                shutil.rmtree(batch_upload_dir, ignore_errors=True)
+                shutil.rmtree(batch_processed_dir, ignore_errors=True)
+                raise
             combined_errors.append(f"{filename}: {exc.detail}")
             continue
+        except BaseException:
+            shutil.rmtree(batch_upload_dir, ignore_errors=True)
+            shutil.rmtree(batch_processed_dir, ignore_errors=True)
+            raise
 
         if uploaded_bytes + written > MAX_TOTAL_UPLOAD_SIZE_BYTES:
-            combined_errors.append(
-                f"{filename}: the combined upload exceeds the 800 MB total size limit."
+            shutil.rmtree(batch_upload_dir, ignore_errors=True)
+            shutil.rmtree(batch_processed_dir, ignore_errors=True)
+            raise HTTPException(
+                status_code=413,
+                detail=f"{filename}: the combined upload exceeds the 800 MB total size limit.",
             )
-            source_path.unlink(missing_ok=True)
-            continue
         uploaded_bytes += written
 
         role = detect_file_role(filename)
@@ -409,8 +475,16 @@ async def process_uploads(
                 filename,
             )
         except HTTPException as exc:
+            if exc.status_code != 422:
+                shutil.rmtree(batch_upload_dir, ignore_errors=True)
+                shutil.rmtree(batch_processed_dir, ignore_errors=True)
+                raise
             combined_errors.append(f"{filename}: {exc.detail}")
             continue
+        except BaseException:
+            shutil.rmtree(batch_upload_dir, ignore_errors=True)
+            shutil.rmtree(batch_processed_dir, ignore_errors=True)
+            raise
 
         errors = summary["validation_errors"]
         if errors:
@@ -453,6 +527,8 @@ async def process_uploads(
         raise HTTPException(status_code=422, detail="Dataset validation failed: " + " | ".join(combined_errors))
 
     if not files:
+        shutil.rmtree(batch_upload_dir, ignore_errors=True)
+        shutil.rmtree(batch_processed_dir, ignore_errors=True)
         raise HTTPException(status_code=422, detail="Dataset validation failed: no valid CSV files.")
 
     feature_rows = next(
@@ -494,14 +570,13 @@ async def process_uploads(
     }
 
     manifest_path = processed_dir / "latest.json"
-    manifest_path.write_text(
-        json.dumps(result, indent=2, default=str),
-        encoding="utf-8",
-    )
-    (processed_dir / batch_id / "manifest.json").write_text(
-        json.dumps(result, indent=2, default=str),
-        encoding="utf-8",
-    )
+    try:
+        _write_json_atomically(batch_processed_dir / "manifest.json", result)
+        _write_json_atomically(manifest_path, result)
+    except BaseException:
+        shutil.rmtree(batch_upload_dir, ignore_errors=True)
+        shutil.rmtree(batch_processed_dir, ignore_errors=True)
+        raise
 
     return result
 

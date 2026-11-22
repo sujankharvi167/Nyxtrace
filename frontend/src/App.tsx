@@ -6,6 +6,7 @@ import {
   TransactionAnalysis,
   MoneyFlow,
   RiskIntelligence,
+  InvestigationCases,
   Reports,
   About,
 } from '@/pages';
@@ -27,6 +28,7 @@ const App: React.FC = () => (
         <Route path="/analysis"   element={<TransactionAnalysis />} />
         <Route path="/money-flow" element={<MoneyFlow />}           />
         <Route path="/risk"       element={<RiskIntelligence />}    />
+        <Route path="/cases"      element={<InvestigationCases />} />
         <Route path="/reports"    element={<Reports />}             />
         <Route path="/about"      element={<About />}               />
         <Route path="*"           element={<NotFound />}            />

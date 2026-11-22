@@ -12,10 +12,11 @@ import {
 } from 'lucide-react';
 import { Link } from 'react-router-dom';
 import { StatCard, SectionHeader, StatusBadge, EmptyState } from '@/components/ui';
+import { MLDashboardOverview } from '@/components/MLDashboardOverview';
 import { useApi } from '@/hooks/useApi';
 import { api } from '@/services/api';
 import { formatNumber } from '@/utils';
-import type { PlatformStats } from '@/types';
+import type { GraphStatistics, GraphStatus, MLStatus, PlatformStats } from '@/types';
 
 /* ── Workflow step ─────────────────────────────────────────────── */
 interface WorkflowStepProps {
@@ -97,6 +98,19 @@ export const Dashboard: React.FC = () => {
   const { data: stats, loading, error } = useApi<PlatformStats>(
     () => api.analysis.getStats() as Promise<PlatformStats>,
   );
+  const datasetLoaded = stats?.total_transactions_analyzed != null;
+  const { data: graphStatusResponse } = useApi(
+    () => api.graph.status(),
+  );
+  const { data: graphStatsResponse } = useApi(
+    () => api.graph.statistics().catch(() => null),
+  );
+  const { data: mlStatusResponse } = useApi(
+    () => api.ml.status(),
+  );
+  const graphStatus = (graphStatusResponse as { data?: GraphStatus } | null)?.data ?? null;
+  const graphStats = (graphStatsResponse as { data?: GraphStatistics } | null)?.data ?? null;
+  const mlStatus = (mlStatusResponse as { data?: MLStatus } | null)?.data ?? null;
 
   return (
     <div className="space-y-6">
@@ -111,11 +125,10 @@ export const Dashboard: React.FC = () => {
         <div className="flex items-start gap-3">
           <Activity className="w-4 h-4 text-blue-400 mt-0.5 flex-shrink-0" />
           <div>
-            <p className="text-sm font-medium text-slate-200">Platform Initialised — Stage 1 Complete</p>
+            <p className="text-sm font-medium text-slate-200">Stage 3 · ML Detection and Analysis</p>
             <p className="text-xs text-slate-400 mt-1">
-              NyxTrace foundation is operational. Upload a transaction dataset via the Analysis workspace to
-              begin investigation. ML pipeline, graph analytics, and risk scoring will be available in
-              subsequent development stages.
+              Upload the Elliptic++ feature and class CSVs in Transaction Analysis, then train and review held-out
+              model results. Unknown transactions remain separate from licit labels; model flags require human review.
             </p>
           </div>
         </div>
@@ -125,7 +138,7 @@ export const Dashboard: React.FC = () => {
       {error && (
         <div className="card p-4" style={{ borderLeft: '2px solid #ef4444' }}>
           <p className="text-xs text-red-400">
-            Backend unreachable — ensure the FastAPI server is running on port 8000.
+            Backend unreachable — ensure the FastAPI server is running on port 8001.
           </p>
         </div>
       )}
@@ -141,16 +154,16 @@ export const Dashboard: React.FC = () => {
         <StatCard
           label="Suspicious Detected"
           value={loading ? '—' : formatNumber(stats?.suspicious_transactions_detected)}
-          subtext="Requires ML pipeline (Stage 3)"
+          subtext="Current model flags appear in Stage 3 summary below"
           icon={<AlertTriangle className="w-4 h-4" />}
           valueClassName="text-slate-400"
         />
         <StatCard
-          label="Accounts Flagged"
-          value={loading ? '—' : formatNumber(stats?.accounts_flagged)}
-          subtext="Requires graph analysis (Stage 4)"
-          icon={<Users className="w-4 h-4" />}
-          valueClassName="text-slate-400"
+          label="Graph Nodes"
+          value={graphStats ? formatNumber(graphStats.nodes) : '—'}
+          subtext={graphStatus?.status === 'ready' ? 'Actual transaction graph nodes' : 'Build graph to populate'}
+          icon={<GitFork className="w-4 h-4" />}
+          valueClassName="text-cyan-300"
         />
         <StatCard
           label="Active Investigations"
@@ -160,19 +173,21 @@ export const Dashboard: React.FC = () => {
         />
       </div>
 
+      <MLDashboardOverview />
+
       {/* Main grid */}
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
         {/* Investigation workflow */}
         <div className="card p-5 lg:col-span-2">
           <p className="section-label mb-5">Investigation Workflow</p>
           <div className="space-y-4">
-            <WorkflowStep number={1} label="Dataset Upload"       description="Upload transaction CSV for processing"             status="active"  />
+            <WorkflowStep number={1} label="Dataset Upload"       description="Upload transaction CSV for processing"             status={datasetLoaded ? 'complete' : 'active'} />
             <div className="ml-3.5 w-px h-3" style={{ backgroundColor: '#263354' }} />
-            <WorkflowStep number={2} label="Data Preprocessing"  description="Validation, cleaning, and feature extraction"      status="pending" />
+            <WorkflowStep number={2} label="Data Preprocessing"  description="Validation, cleaning, and feature extraction"      status={datasetLoaded ? 'complete' : 'pending'} />
             <div className="ml-3.5 w-px h-3" style={{ backgroundColor: '#263354' }} />
-            <WorkflowStep number={3} label="ML Detection"        description="Suspicious transaction classification"              status="pending" />
+            <WorkflowStep number={3} label="ML Detection"        description="Train, evaluate, explain, and review predictions"    status={mlStatus?.status === 'completed' ? 'complete' : datasetLoaded ? 'active' : 'pending'} />
             <div className="ml-3.5 w-px h-3" style={{ backgroundColor: '#263354' }} />
-            <WorkflowStep number={4} label="Graph Intelligence"  description="Transaction network construction and analysis"     status="pending" />
+            <WorkflowStep number={4} label="Graph Intelligence"  description="Transaction network construction and analysis"     status={graphStatus?.status === 'ready' ? 'complete' : datasetLoaded ? 'active' : 'pending'} />
             <div className="ml-3.5 w-px h-3" style={{ backgroundColor: '#263354' }} />
             <WorkflowStep number={5} label="Risk Analysis"       description="Risk scoring and pattern identification"           status="pending" />
             <div className="ml-3.5 w-px h-3" style={{ backgroundColor: '#263354' }} />
@@ -225,13 +240,13 @@ export const Dashboard: React.FC = () => {
                 <div
                   key={s}
                   className="w-6 h-1.5 rounded-full"
-                  style={{ backgroundColor: s === '1' ? '#3b82f6' : '#1e2d4a' }}
+                  style={{ backgroundColor: Number(s) <= 3 ? '#3b82f6' : '#1e2d4a' }}
                   title={`Stage ${s}`}
                 />
               ))}
             </div>
           </div>
-          <span className="text-xs text-blue-400 font-medium">Stage 1 of 6 — Foundation</span>
+          <span className="text-xs text-blue-400 font-medium">Stage 3 of 6 — ML Detection</span>
         </div>
       </div>
     </div>

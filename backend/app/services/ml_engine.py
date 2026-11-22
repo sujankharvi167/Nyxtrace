@@ -1,12 +1,15 @@
 import ctypes
 import hashlib
+import heapq
 import json
 import math
 import os
 import re
+import sqlite3
 import threading
 import uuid
 import warnings
+from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
@@ -140,21 +143,34 @@ def _metrics(y_true: np.ndarray, probabilities: np.ndarray, threshold: float) ->
         int(value)
         for value in confusion_matrix(y_true, predictions, labels=[0, 1]).ravel()
     )
+    has_both_classes = len(np.unique(y_true)) == 2
     return {
         "accuracy": float(accuracy_score(y_true, predictions)),
         "precision": float(precision_score(y_true, predictions, zero_division=0)),
-        "recall": float(recall_score(y_true, predictions, zero_division=0)),
+        "recall": (
+            float(recall_score(y_true, predictions, zero_division=0))
+            if np.count_nonzero(y_true == 1)
+            else None
+        ),
         "f1": float(f1_score(y_true, predictions, zero_division=0)),
-        "roc_auc": float(roc_auc_score(y_true, probabilities)),
-        "pr_auc": float(average_precision_score(y_true, probabilities)),
+        "roc_auc": float(roc_auc_score(y_true, probabilities)) if has_both_classes else None,
+        "pr_auc": float(average_precision_score(y_true, probabilities)) if has_both_classes else None,
+        "unavailable_metric_reason": (
+            None
+            if has_both_classes
+            else (
+                "ROC-AUC and PR-AUC require both classes in the held-out split; "
+                "recall/FNR also require at least one illicit test record, and FPR requires at least one licit test record."
+            )
+        ),
         "confusion_matrix": {
             "true_negative": tn,
             "false_positive": fp,
             "false_negative": fn,
             "true_positive": tp,
         },
-        "false_positive_rate": float(fp / (fp + tn)) if (fp + tn) else 0.0,
-        "false_negative_rate": float(fn / (fn + tp)) if (fn + tp) else 0.0,
+        "false_positive_rate": float(fp / (fp + tn)) if (fp + tn) else None,
+        "false_negative_rate": float(fn / (fn + tp)) if (fn + tp) else None,
         "threshold": float(threshold),
         "positive_class": "illicit",
     }
@@ -168,7 +184,9 @@ class MLEngine:
         self.results_path = self.ml_dir / "results.json"
         self.model_path = self.ml_dir / "best_model.joblib"
         self.predictions_path = self.ml_dir / "predictions.csv"
+        self.prediction_index_path = self.ml_dir / "predictions.sqlite3"
         self._lock = threading.Lock()
+        self._prediction_index_lock = threading.Lock()
         self._thread: Optional[threading.Thread] = None
         self._state = self._load_state()
 
@@ -204,14 +222,37 @@ class MLEngine:
 
     def get_status(self) -> Dict[str, Any]:
         with self._lock:
-            return dict(self._state)
+            state = dict(self._state)
+        if state.get("status") != "completed":
+            return state
+        try:
+            self._load_results()
+        except HTTPException as exc:
+            if exc.status_code != 409:
+                raise
+            return {
+                **state,
+                "status": "stale",
+                "dataset_stale": True,
+                "message": str(exc.detail),
+            }
+        return {**state, "dataset_stale": False}
+
+    def has_current_results(self) -> bool:
+        try:
+            self._load_results()
+        except HTTPException as exc:
+            if exc.status_code == 409:
+                return False
+            raise
+        return True
 
     def _latest_paths(self) -> Tuple[Dict[str, Any], Path, Path, Path]:
         manifest = load_latest_dataset(self.backend_dir)
         if not manifest:
             raise HTTPException(status_code=409, detail="Upload a dataset before training a model.")
         batch_id = str(manifest.get("batch_id", ""))
-        if not re.fullmatch(r"\d{8}-\d{6}", batch_id):
+        if not re.fullmatch(r"\d{8}-\d{6}(?:-[a-f0-9]{8})?", batch_id):
             raise HTTPException(status_code=409, detail="The latest dataset manifest has an invalid batch identifier.")
         upload_dir = (self.backend_dir / "data" / "uploads" / batch_id).resolve()
         expected_root = (self.backend_dir / "data" / "uploads").resolve()
@@ -359,6 +400,7 @@ class MLEngine:
         if classes[class_id].duplicated().any():
             raise ValueError("The class CSV contains duplicate transaction identifiers.")
         labels = dict(zip(classes[class_id].astype(str), classes[class_label].map(normalize_label)))
+        del classes
         class_distribution = {
             label: int(sum(value == label for value in labels.values()))
             for label in ("licit", "illicit", "unknown")
@@ -412,10 +454,10 @@ class MLEngine:
                 raise ValueError("The feature CSV contains empty transaction identifiers.")
             if ids.duplicated().any():
                 raise ValueError("The feature CSV contains duplicate transaction identifiers.")
-            duplicate_across_chunks = next((identifier for identifier in ids if identifier in seen_ids), None)
-            if duplicate_across_chunks is not None:
-                raise ValueError(f"Duplicate feature transaction ID detected: {duplicate_across_chunks}")
-            seen_ids.update(ids.tolist())
+            for identifier in ids:
+                if identifier in seen_ids:
+                    raise ValueError(f"Duplicate feature transaction ID detected: {identifier}")
+                seen_ids.add(identifier)
 
             row_labels = ids.map(labels)
             matched_rows += int(row_labels.notna().sum())
@@ -476,7 +518,7 @@ class MLEngine:
                     target = train_counts if step <= cutoff else test_counts
                     for label in target:
                         target[label] += time_counts[step][label]
-                if min(train_counts.values()) == 0 or min(test_counts.values()) == 0:
+                if min(train_counts.values()) == 0 or sum(test_counts.values()) == 0:
                     continue
                 test_count = sum(test_counts.values())
                 target_fraction = abs((test_count / max(total_supervised, 1)) - 0.20)
@@ -488,8 +530,6 @@ class MLEngine:
                 _, time_cutoff, split_counts = min(candidates, key=lambda item: item[0])
                 split_strategy = "chronological_time_step"
 
-        fallback_train_ids: set[str] = set()
-        fallback_test_ids: set[str] = set()
         split_ids: Dict[str, Dict[str, List[str]]] = {
             "train": {"licit": [], "illicit": []},
             "test": {"licit": [], "illicit": []},
@@ -500,16 +540,17 @@ class MLEngine:
             split_counts = {"train": {}, "test": {}}
             for label in ("licit", "illicit"):
                 identifiers = fallback_ids[label]
-                if len(identifiers) < 2:
-                    raise ValueError(f"At least two {label} records are required for stratified train/test splitting.")
-                train_ids, test_ids = train_test_split(
-                    identifiers,
-                    test_size=0.20,
-                    random_state=RANDOM_SEED,
-                    shuffle=True,
-                )
-                fallback_train_ids.update(train_ids)
-                fallback_test_ids.update(test_ids)
+                if not identifiers:
+                    raise ValueError(f"At least one {label} record is required for model training.")
+                if len(identifiers) == 1:
+                    train_ids, test_ids = identifiers, []
+                else:
+                    train_ids, test_ids = train_test_split(
+                        identifiers,
+                        test_size=0.20,
+                        random_state=RANDOM_SEED,
+                        shuffle=True,
+                    )
                 split_ids["train"][label] = train_ids
                 split_ids["test"][label] = test_ids
                 split_counts["train"][label] = len(train_ids)
@@ -526,8 +567,8 @@ class MLEngine:
                 f"Only {matched_supervised_rows:,} feature rows match licit/illicit labels; "
                 f"{available_supervised:,} labeled records were expected."
             )
-        if min(split_counts["train"].values()) == 0 or min(split_counts["test"].values()) == 0:
-            raise ValueError("The selected train/test split does not contain both supervised classes.")
+        if min(split_counts["train"].values()) == 0 or sum(split_counts["test"].values()) == 0:
+            raise ValueError("The selected train/test split must contain both training classes and at least one test record.")
 
         memory_budget = min(MEMORY_BUDGET_CAP, max(128 * 1024 * 1024, _available_memory_bytes() // 4))
         estimated_bytes = available_supervised * len(numeric_columns) * 4 * TRAINING_MEMORY_MULTIPLIER
@@ -558,10 +599,28 @@ class MLEngine:
                     target_count = sampling_targets[(split, label)]
                     if target_count < len(candidates):
                         selected_ids.update(
-                            sorted(candidates, key=_stable_hash)[:target_count]
+                            heapq.nsmallest(target_count, candidates, key=_stable_hash)
                         )
                     else:
                         selected_ids.update(candidates)
+        if split_strategy == "stratified_random":
+            train_identifiers = set(split_ids["train"]["licit"])
+            train_identifiers.update(split_ids["train"]["illicit"])
+            test_identifiers = set(split_ids["test"]["licit"])
+            test_identifiers.update(split_ids["test"]["illicit"])
+        else:
+            train_identifiers = set()
+            test_identifiers = set()
+        del seen_ids, fallback_ids, time_counts, time_ids, split_ids
+
+        train_record_count = sum(sampling_targets[("train", label)] for label in ("licit", "illicit"))
+        test_record_count = sum(sampling_targets[("test", label)] for label in ("licit", "illicit"))
+        X_train = np.empty((train_record_count, len(numeric_columns)), dtype=np.float32)
+        X_test = np.empty((test_record_count, len(numeric_columns)), dtype=np.float32)
+        y_train = np.empty(train_record_count, dtype=np.int8)
+        y_test = np.empty(test_record_count, dtype=np.int8)
+        train_cursor = 0
+        test_cursor = 0
         progress(
             progress=25,
             message=(
@@ -572,12 +631,6 @@ class MLEngine:
             dataset_rows=feature_rows,
         )
 
-        train_features: List[np.ndarray] = []
-        test_features: List[np.ndarray] = []
-        train_labels: List[np.ndarray] = []
-        test_labels: List[np.ndarray] = []
-        train_ids: List[str] = []
-        test_ids: List[str] = []
         prepared_rows = 0
         next_prepare_progress = 50_000
         for chunk in _iter_csv_chunks(
@@ -606,17 +659,17 @@ class MLEngine:
                 in_train = np.isfinite(steps) & (steps <= float(time_cutoff))
                 in_test = np.isfinite(steps) & (steps > float(time_cutoff))
             else:
-                in_train = ids.isin(fallback_train_ids).to_numpy()
-                in_test = ids.isin(fallback_test_ids).to_numpy()
+                in_train = ids.isin(train_identifiers).to_numpy()
+                in_test = ids.isin(test_identifiers).to_numpy()
             values = chunk[numeric_columns].apply(pd.to_numeric, errors="coerce").to_numpy(
                 dtype=np.float32,
                 na_value=np.nan,
             )
             values[~np.isfinite(values)] = np.nan
 
-            for split, mask, feature_list, label_list, id_list in (
-                ("train", is_supervised & in_train, train_features, train_labels, train_ids),
-                ("test", is_supervised & in_test, test_features, test_labels, test_ids),
+            for split, mask in (
+                ("train", is_supervised & in_train),
+                ("test", is_supervised & in_test),
             ):
                 if not mask.any():
                     continue
@@ -626,21 +679,23 @@ class MLEngine:
                     if not keep.any():
                         continue
                     selected = selected[keep]
-                feature_list.append(values[selected])
-                label_list.append(is_illicit[selected].astype(np.int8))
-                id_list.extend(ids.iloc[selected].tolist())
+                if split == "train":
+                    end = train_cursor + len(selected)
+                    X_train[train_cursor:end] = values[selected]
+                    y_train[train_cursor:end] = is_illicit[selected].astype(np.int8)
+                    train_cursor = end
+                else:
+                    end = test_cursor + len(selected)
+                    X_test[test_cursor:end] = values[selected]
+                    y_test[test_cursor:end] = is_illicit[selected].astype(np.int8)
+                    test_cursor = end
             del values
 
-        del seen_ids, fallback_ids, time_counts, time_ids, split_ids, selected_ids
-        if not train_features or not test_features:
+        del selected_ids, train_identifiers, test_identifiers
+        if train_cursor != train_record_count or test_cursor != test_record_count:
             raise ValueError("No records remained after applying the selected train/test split.")
-        X_train = np.concatenate(train_features, axis=0)
-        X_test = np.concatenate(test_features, axis=0)
-        y_train = np.concatenate(train_labels)
-        y_test = np.concatenate(test_labels)
-        del train_features, test_features, train_labels, test_labels
-        if len(np.unique(y_train)) != 2 or len(np.unique(y_test)) != 2:
-            raise ValueError("The reproducible split/sample does not contain both classes in train and test.")
+        if len(np.unique(y_train)) != 2 or y_test.size == 0:
+            raise ValueError("The reproducible split/sample must contain both training classes and at least one test record.")
 
         train_valid = np.isfinite(X_train)
         valid_counts = train_valid.sum(axis=0)
@@ -668,8 +723,6 @@ class MLEngine:
         X_train = np.where(np.isfinite(X_train), X_train, medians).astype(np.float32, copy=False)
         X_test = np.where(np.isfinite(X_test), X_test, medians).astype(np.float32, copy=False)
 
-        del train_ids
-        del fallback_train_ids, fallback_test_ids
         progress(
             progress=43,
             message=(
@@ -804,6 +857,12 @@ class MLEngine:
                 progress=progress,
                 total_rows=feature_rows,
             )
+            latest = load_latest_dataset(self.backend_dir)
+            if not latest or latest.get("batch_id") != manifest["batch_id"]:
+                raise HTTPException(
+                    status_code=409,
+                    detail="The dataset changed during training; the new results were not published.",
+                )
             os.replace(prediction_tmp, self.predictions_path)
         except Exception:
             prediction_tmp.unlink(missing_ok=True)
@@ -939,20 +998,169 @@ class MLEngine:
         ]
 
     def _load_results(self) -> Dict[str, Any]:
+        with self._lock:
+            state_status = self._state.get("status")
+            if state_status == "running":
+                raise HTTPException(
+                    status_code=409,
+                    detail="A new model training run is in progress; wait for it to complete before reading results.",
+                )
+            if state_status == "error":
+                raise HTTPException(
+                    status_code=409,
+                    detail="The last model training run failed; retrain before reading persisted results.",
+                )
         if not self.results_path.exists():
             raise HTTPException(status_code=409, detail="No completed model evaluation is available.")
         try:
-            return json.loads(self.results_path.read_text(encoding="utf-8"))
+            results = json.loads(self.results_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
             raise HTTPException(status_code=500, detail="The persisted model results could not be read.") from exc
+        latest = load_latest_dataset(self.backend_dir)
+        if not latest:
+            raise HTTPException(
+                status_code=409,
+                detail="No current dataset is available; saved model results cannot be used.",
+            )
+        trained_batch = str(results.get("dataset", {}).get("batch_id", ""))
+        current_batch = str(latest.get("batch_id", ""))
+        if not trained_batch or trained_batch != current_batch:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"Model results belong to dataset {trained_batch or 'unknown'}, but the current "
+                    f"dataset is {current_batch or 'unknown'}. Retrain before using these results."
+                ),
+            )
+        return results
+
+    def _ensure_prediction_index(self, results: Dict[str, Any]) -> None:
+        if not self.predictions_path.is_file():
+            raise HTTPException(status_code=409, detail="No prediction results are available.")
+        stat = self.predictions_path.stat()
+        signature = ":".join(
+            (
+                str(results["dataset"]["batch_id"]),
+                str(results["trained_at"]),
+                str(results["best_model"]),
+                str(stat.st_size),
+                str(stat.st_mtime_ns),
+            )
+        )
+        with self._prediction_index_lock:
+            if self.prediction_index_path.is_file():
+                try:
+                    with closing(sqlite3.connect(self.prediction_index_path)) as connection:
+                        stored_signature = connection.execute(
+                            "SELECT value FROM metadata WHERE key = 'signature'"
+                        ).fetchone()
+                    if stored_signature and stored_signature[0] == signature:
+                        return
+                except sqlite3.Error:
+                    pass
+
+            temporary_path = self.ml_dir / f"predictions.{uuid.uuid4().hex}.sqlite3"
+            connection: Optional[sqlite3.Connection] = None
+            try:
+                connection = sqlite3.connect(temporary_path)
+                connection.execute(
+                    """
+                    CREATE TABLE predictions (
+                        row_number INTEGER PRIMARY KEY,
+                        transaction_id TEXT NOT NULL UNIQUE,
+                        illicit_probability REAL NOT NULL,
+                        confidence REAL NOT NULL,
+                        selected_model TEXT NOT NULL,
+                        ground_truth_label TEXT NOT NULL
+                    )
+                    """
+                )
+                connection.execute(
+                    "CREATE INDEX prediction_probability_idx ON predictions(illicit_probability)"
+                )
+                connection.execute(
+                    "CREATE INDEX prediction_confidence_idx ON predictions(confidence)"
+                )
+                connection.execute("CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+
+                columns = pd.read_csv(self.predictions_path, nrows=0).columns.tolist()
+                selected_model_column = "selected_model" in columns
+                row_number = 0
+                with pd.read_csv(
+                    self.predictions_path,
+                    dtype={"transaction_id": "string", "ground_truth_label": "string"},
+                    chunksize=CSV_CHUNK_SIZE,
+                ) as reader:
+                    for chunk in reader:
+                        if selected_model_column:
+                            if not chunk["selected_model"].astype(str).eq(results["best_model"]).all():
+                                raise HTTPException(
+                                    status_code=409,
+                                    detail="Prediction rows do not match the selected model; retrain the current dataset.",
+                                )
+                        else:
+                            chunk["selected_model"] = results["best_model"]
+                        records = []
+                        for item in chunk.itertuples(index=False):
+                            records.append(
+                                (
+                                    row_number,
+                                    str(item.transaction_id),
+                                    float(item.illicit_probability),
+                                    float(item.confidence),
+                                    str(item.selected_model),
+                                    str(item.ground_truth_label),
+                                )
+                            )
+                            row_number += 1
+                        connection.executemany(
+                            """
+                            INSERT INTO predictions (
+                                row_number, transaction_id, illicit_probability,
+                                confidence, selected_model, ground_truth_label
+                            ) VALUES (?, ?, ?, ?, ?, ?)
+                            """,
+                            records,
+                        )
+                connection.execute(
+                    "INSERT INTO metadata (key, value) VALUES ('signature', ?)",
+                    (signature,),
+                )
+                connection.commit()
+                connection.close()
+                connection = None
+                os.replace(temporary_path, self.prediction_index_path)
+            except HTTPException:
+                if connection is not None:
+                    connection.close()
+                temporary_path.unlink(missing_ok=True)
+                raise
+            except (OSError, sqlite3.Error, ValueError, KeyError) as exc:
+                if connection is not None:
+                    connection.close()
+                temporary_path.unlink(missing_ok=True)
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"Could not prepare the prediction index: {exc}",
+                ) from exc
 
     def _load_bundle(self) -> Dict[str, Any]:
         if not self.model_path.exists():
             raise HTTPException(status_code=409, detail="No trained model is available. Start training first.")
         try:
-            return joblib.load(self.model_path)
+            bundle = joblib.load(self.model_path)
         except Exception as exc:
             raise HTTPException(status_code=500, detail=f"The persisted model could not be loaded: {exc}") from exc
+        results = self._load_results()
+        if (
+            bundle.get("metadata", {}).get("batch_id") != results["dataset"]["batch_id"]
+            or bundle.get("best_model_name") != results["best_model"]
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="The saved model and evaluation results do not describe the same training run.",
+            )
+        return bundle
 
     def evaluation(self) -> Dict[str, Any]:
         results = self._load_results()
@@ -992,6 +1200,8 @@ class MLEngine:
         search: Optional[str] = None,
         predicted_class: Optional[str] = None,
         suspicious_only: bool = False,
+        sort_by: Optional[str] = None,
+        sort_order: str = "asc",
     ) -> Dict[str, Any]:
         if not 0.0 <= threshold <= 1.0:
             raise HTTPException(status_code=422, detail="Threshold must be between 0 and 1.")
@@ -1004,38 +1214,68 @@ class MLEngine:
             )
         if predicted_class not in (None, "licit", "illicit"):
             raise HTTPException(status_code=422, detail="Predicted class must be licit or illicit.")
-        if not self.predictions_path.is_file():
-            raise HTTPException(status_code=409, detail="No prediction results are available.")
+        if sort_by not in (None, "transaction_id", "predicted_class", "illicit_probability", "confidence"):
+            raise HTTPException(status_code=422, detail="Unsupported prediction sort field.")
+        if sort_order not in ("asc", "desc"):
+            raise HTTPException(status_code=422, detail="Sort order must be 'asc' or 'desc'.")
 
-        offset = (page - 1) * page_size
-        total = 0
-        rows: List[Dict[str, Any]] = []
-        with pd.read_csv(
-            self.predictions_path,
-            dtype={"transaction_id": "string", "ground_truth_label": "string"},
-            chunksize=CSV_CHUNK_SIZE,
-        ) as reader:
-            selected_model = None
-            if "selected_model" not in pd.read_csv(self.predictions_path, nrows=0).columns:
-                selected_model = self._load_results()["best_model"]
-            for chunk in reader:
-                if selected_model is not None:
-                    chunk["selected_model"] = selected_model
-                probabilities = pd.to_numeric(chunk["illicit_probability"], errors="coerce")
-                classes = np.where(probabilities >= threshold, "illicit", "licit")
-                chunk["predicted_class"] = classes
-                mask = probabilities.ge(threshold) if suspicious_only else pd.Series(True, index=chunk.index)
-                if predicted_class:
-                    mask &= chunk["predicted_class"].eq(predicted_class)
-                if search:
-                    mask &= chunk["transaction_id"].str.contains(search, case=False, regex=False, na=False)
-                selected = chunk.loc[mask, PREDICTION_COLUMNS]
-                previous_total = total
-                total += len(selected)
-                if total > offset and len(rows) < page_size:
-                    start = max(0, offset - previous_total)
-                    portion = selected.iloc[start : start + page_size - len(rows)]
-                    rows.extend(portion.to_dict(orient="records"))
+        results = self._load_results()
+        self._ensure_prediction_index(results)
+        conditions: List[str] = []
+        parameters: List[Any] = []
+        if suspicious_only:
+            conditions.append("illicit_probability >= ?")
+            parameters.append(threshold)
+        if predicted_class == "illicit":
+            conditions.append("illicit_probability >= ?")
+            parameters.append(threshold)
+        elif predicted_class == "licit":
+            conditions.append("illicit_probability < ?")
+            parameters.append(threshold)
+        if search:
+            conditions.append("instr(lower(transaction_id), lower(?)) > 0")
+            parameters.append(search)
+        where_clause = f" WHERE {' AND '.join(conditions)}" if conditions else ""
+
+        sort_expressions = {
+            "transaction_id": "transaction_id COLLATE BINARY",
+            "predicted_class": "CASE WHEN illicit_probability >= ? THEN 1 ELSE 0 END",
+            "illicit_probability": "illicit_probability",
+            "confidence": "confidence",
+        }
+        order_clause = "row_number ASC"
+        order_parameters: List[Any] = []
+        if sort_by:
+            order_clause = f"{sort_expressions[sort_by]} {sort_order.upper()}, transaction_id COLLATE BINARY ASC"
+            if sort_by == "predicted_class":
+                order_parameters.append(threshold)
+
+        with closing(sqlite3.connect(self.prediction_index_path)) as connection:
+            total = int(
+                connection.execute(
+                    f"SELECT COUNT(*) FROM predictions{where_clause}",
+                    parameters,
+                ).fetchone()[0]
+            )
+            selected = connection.execute(
+                f"""
+                SELECT
+                    transaction_id,
+                    CASE WHEN illicit_probability >= ? THEN 'illicit' ELSE 'licit' END,
+                    illicit_probability,
+                    confidence,
+                    selected_model,
+                    ground_truth_label
+                FROM predictions{where_clause}
+                ORDER BY {order_clause}
+                LIMIT ? OFFSET ?
+                """,
+                [threshold, *parameters, *order_parameters, page_size, (page - 1) * page_size],
+            ).fetchall()
+        rows = [
+            dict(zip(PREDICTION_COLUMNS, row))
+            for row in selected
+        ]
 
         return {
             "items": _json_safe(rows),
@@ -1045,6 +1285,49 @@ class MLEngine:
             "total_pages": math.ceil(total / page_size) if total else 0,
             "threshold": threshold,
             "positive_class": "illicit",
+        }
+
+    def summary(self, threshold: float = DEFAULT_THRESHOLD) -> Dict[str, Any]:
+        if not 0.0 <= threshold <= 1.0:
+            raise HTTPException(status_code=422, detail="Threshold must be between 0 and 1.")
+        results = self._load_results()
+        self._ensure_prediction_index(results)
+        with closing(sqlite3.connect(self.prediction_index_path)) as connection:
+            row = connection.execute(
+                """
+                SELECT
+                    COUNT(*),
+                    SUM(CASE WHEN illicit_probability >= ? THEN 1 ELSE 0 END),
+                    SUM(CASE WHEN illicit_probability < ? THEN 1 ELSE 0 END),
+                    SUM(CASE WHEN ground_truth_label = 'licit' THEN 1 ELSE 0 END),
+                    SUM(CASE WHEN ground_truth_label = 'illicit' THEN 1 ELSE 0 END),
+                    SUM(CASE WHEN ground_truth_label = 'unknown' THEN 1 ELSE 0 END),
+                    SUM(CASE WHEN ground_truth_label = 'unlabeled' THEN 1 ELSE 0 END)
+                FROM predictions
+                """,
+                (threshold, threshold),
+            ).fetchone()
+        total_predictions = int(row[0] or 0)
+        label_counts = results["dataset"]["available_class_distribution"]
+        return {
+            "batch_id": results["dataset"]["batch_id"],
+            "total_transactions": int(results["dataset"]["feature_rows"]),
+            "label_counts": label_counts,
+            "total_predictions": total_predictions,
+            "prediction_distribution": {
+                "licit": int(row[2] or 0),
+                "illicit": int(row[1] or 0),
+            },
+            "ground_truth_distribution": {
+                "licit": int(row[3] or 0),
+                "illicit": int(row[4] or 0),
+                "unknown": int(row[5] or 0),
+                "unlabeled": int(row[6] or 0),
+            },
+            "suspicious_count": int(row[1] or 0),
+            "suspicious_rate": float((row[1] or 0) / total_predictions) if total_predictions else 0.0,
+            "threshold": threshold,
+            "best_model": results["best_model"],
         }
 
     def explain(self, transaction_id: str) -> Dict[str, Any]:

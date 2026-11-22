@@ -16,8 +16,10 @@ export default defineConfig(({ mode }) => {
       port: 5173,
       proxy: {
         '/api': {
-          target: env.NYXTRACE_API_TARGET || 'http://localhost:8000',
+          target: env.NYXTRACE_API_TARGET || 'http://localhost:8001',
           changeOrigin: true,
+          timeout: 2 * 60 * 60 * 1000,
+          proxyTimeout: 2 * 60 * 60 * 1000,
         },
       },
     },

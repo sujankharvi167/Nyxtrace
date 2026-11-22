@@ -3,9 +3,15 @@ import io
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
+from fastapi import HTTPException
+from fastapi.testclient import TestClient
 from starlette.datastructures import UploadFile
 
+import app.api.analysis as analysis_api
+import app.api.ml as ml_api
+from app.main import app
 from app.services.dataset_processor import (
     MAX_FILE_SIZE_BYTES,
     MAX_TOTAL_UPLOAD_SIZE_BYTES,
@@ -75,6 +81,7 @@ class DatasetProcessorTests(unittest.TestCase):
             with self.assertRaises(Exception) as context:
                 asyncio.run(process_uploads(Path(temp_dir), [upload]))
             self.assertIn("750 MB", str(context.exception))
+            self.assertEqual(context.exception.status_code, 413)
 
     def test_backend_rejects_combined_upload_above_800_mb(self):
         uploads = [
@@ -88,6 +95,63 @@ class DatasetProcessorTests(unittest.TestCase):
             with self.assertRaises(Exception) as context:
                 asyncio.run(process_uploads(Path(temp_dir), uploads))
             self.assertIn("800 MB total size limit", str(context.exception))
+            self.assertEqual(context.exception.status_code, 413)
+
+    def test_streamed_size_limit_cleans_incomplete_batch(self):
+        upload = UploadFile(filename="txs_features.csv", file=io.BytesIO(b"txId\n123\n"))
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with patch("app.services.dataset_processor.MAX_FILE_SIZE_BYTES", 5), patch(
+                "app.services.dataset_processor.STREAM_CHUNK_SIZE", 4
+            ):
+                with self.assertRaises(HTTPException) as context:
+                    asyncio.run(process_uploads(Path(temp_dir), [upload]))
+            self.assertEqual(context.exception.status_code, 413)
+            upload_root = Path(temp_dir) / "data" / "uploads"
+            self.assertEqual(list(upload_root.iterdir()), [])
+
+    def test_interrupted_stream_removes_partial_upload_and_batch(self):
+        upload = UploadFile(filename="txs_features.csv", file=io.BytesIO(b"txId\n123\n"))
+        read_count = 0
+
+        async def interrupted_read(size):
+            nonlocal read_count
+            read_count += 1
+            if read_count == 1:
+                return b"txId"
+            raise asyncio.CancelledError()
+
+        upload.read = interrupted_read
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with patch("app.services.dataset_processor.STREAM_CHUNK_SIZE", 4):
+                with self.assertRaises(asyncio.CancelledError):
+                    asyncio.run(process_uploads(Path(temp_dir), [upload]))
+            upload_root = Path(temp_dir) / "data" / "uploads"
+            self.assertEqual(list(upload_root.iterdir()), [])
+
+    def test_upload_endpoint_persists_dataset_and_reports_readiness(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            backend_dir = Path(temp_dir)
+            engine = __import__("app.services.ml_engine", fromlist=["MLEngine"]).MLEngine(backend_dir)
+            files = [
+                ("files", ("txs_features.csv", b"txId,signal\n1,0.2\n2,0.8\n", "text/csv")),
+                ("files", ("txs_classes.csv", b"txId,class\n1,2\n2,1\n", "text/csv")),
+            ]
+            with patch.object(analysis_api, "BACKEND_DIR", backend_dir), patch.object(
+                analysis_api, "ml_engine", engine
+            ), patch.object(ml_api, "ml_engine", engine):
+                client = TestClient(app)
+                response = client.post("/api/analysis/upload", files=files)
+                self.assertEqual(response.status_code, 200, response.text)
+                batch_id = response.json()["data"]["batch_id"]
+                dataset = client.get("/api/analysis/dataset").json()["data"]
+                readiness = client.get("/api/ml/readiness").json()["data"]
+                status = client.get("/api/analysis/status").json()["data"]
+
+            self.assertEqual(dataset["batch_id"], batch_id)
+            self.assertTrue(readiness["ready"])
+            self.assertEqual(readiness["label_counts"]["unknown"], 0)
+            self.assertEqual(status["batch_id"], batch_id)
+            self.assertEqual(status["ml_pipeline"], "idle")
 
 
 if __name__ == "__main__":

@@ -8,8 +8,13 @@ class Settings(BaseSettings):
     APP_ENV: str = "development"
     DEBUG: bool = True
     HOST: str = "0.0.0.0"
-    PORT: int = 8000
+    PORT: int = 8001
     ALLOWED_ORIGINS: str = "http://localhost:5173,http://localhost:3000"
+    RISK_ASSESSMENT_VERSION: str = "nyxtrace-risk-v1"
+    RISK_ML_WEIGHT: float = 0.70
+    RISK_GRAPH_CONNECTIVITY_WEIGHT: float = 0.10
+    RISK_GRAPH_SUSPICIOUS_NEIGHBOR_WEIGHT: float = 0.10
+    RISK_PATTERN_WEIGHT: float = 0.10
 
     @property
     def cors_origins(self) -> List[str]:

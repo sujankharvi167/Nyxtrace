@@ -5,11 +5,12 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+import numpy as np
 from fastapi.testclient import TestClient
 
 import app.api.ml as ml_api
 from app.main import app
-from app.services.ml_engine import MLEngine
+from app.services.ml_engine import MLEngine, _metrics
 
 
 class MLEngineTests(unittest.TestCase):
@@ -109,6 +110,73 @@ class MLEngineTests(unittest.TestCase):
         )
         self.assertEqual(suspicious["total"], 0)
 
+    def test_single_class_holdout_metrics_are_reported_as_unavailable(self):
+        metrics = _metrics(np.array([0, 0]), np.array([0.1, 0.8]), 0.5)
+        self.assertIsNone(metrics["roc_auc"])
+        self.assertIsNone(metrics["pr_auc"])
+        self.assertIsNone(metrics["recall"])
+        self.assertIsNone(metrics["false_negative_rate"])
+        self.assertIsNotNone(metrics["false_positive_rate"])
+        self.assertIn("require both classes", metrics["unavailable_metric_reason"])
+
+    def test_training_supports_a_single_rare_class_without_fabricating_metrics(self):
+        class_path = self.backend_dir / "data" / "uploads" / "20261203-111111" / "txs_classes.csv"
+        with class_path.open(encoding="utf-8", newline="") as file:
+            rows = list(csv.DictReader(file))
+        retained_illicit = False
+        for row in rows:
+            if row["class"] == "1":
+                if retained_illicit:
+                    row["class"] = "2"
+                else:
+                    retained_illicit = True
+        with class_path.open("w", encoding="utf-8", newline="") as file:
+            writer = csv.DictWriter(file, fieldnames=["txId", "class"])
+            writer.writeheader()
+            writer.writerows(rows)
+
+        results = self.engine.run_training()
+        metrics = results["models"][results["best_model"]]
+        self.assertEqual(results["dataset"]["trained_class_distribution"]["illicit"], 1)
+        self.assertEqual(results["dataset"]["evaluated_class_distribution"]["illicit"], 0)
+        self.assertIsNone(metrics["roc_auc"])
+        self.assertIsNone(metrics["pr_auc"])
+        self.assertIsNone(metrics["recall"])
+        self.assertIsNone(metrics["false_negative_rate"])
+
+    def test_predictions_support_global_sorting_and_summary_statistics(self):
+        self.engine.run_training()
+        page = self.engine.predictions(
+            page=1,
+            page_size=20,
+            sort_by="illicit_probability",
+            sort_order="desc",
+        )
+        probabilities = [item["illicit_probability"] for item in page["items"]]
+        self.assertEqual(probabilities, sorted(probabilities, reverse=True))
+        summary = self.engine.summary(0.5)
+        self.assertEqual(summary["total_predictions"], 75)
+        self.assertEqual(
+            summary["prediction_distribution"]["licit"] + summary["prediction_distribution"]["illicit"],
+            75,
+        )
+        self.assertEqual(
+            summary["suspicious_count"],
+            summary["prediction_distribution"]["illicit"],
+        )
+
+    def test_results_are_invalidated_when_dataset_changes(self):
+        self.engine.run_training()
+        manifest_path = self.backend_dir / "data" / "processed" / "latest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["batch_id"] = "20261204-111111"
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+        self.assertEqual(self.engine.get_status()["status"], "stale")
+        with self.assertRaises(Exception) as context:
+            self.engine.evaluation()
+        self.assertEqual(context.exception.status_code, 409)
+
     def test_stratified_memory_sampling_keeps_both_labels_in_each_split(self):
         with patch("app.services.ml_engine.MEMORY_BUDGET_CAP", 2):
             results = self.engine.run_training()
@@ -157,8 +225,17 @@ class MLEngineTests(unittest.TestCase):
             self.assertEqual(client.get("/api/ml/status").status_code, 200)
             self.assertEqual(client.get("/api/ml/evaluation").status_code, 200)
             self.assertEqual(client.get("/api/ml/models").status_code, 200)
+            self.assertEqual(client.get("/api/ml/summary").status_code, 200)
             self.assertEqual(client.get("/api/ml/feature-importance").status_code, 200)
             self.assertEqual(client.get("/api/ml/predictions?page=1&page_size=5").status_code, 200)
+            sorted_predictions = client.get(
+                "/api/ml/predictions?page=1&page_size=5&sort_by=illicit_probability&sort_order=desc"
+            )
+            self.assertEqual(sorted_predictions.status_code, 200)
+            self.assertEqual(
+                client.get("/api/ml/predictions?sort_by=invalid").status_code,
+                422,
+            )
             self.assertEqual(client.get("/api/ml/suspicious?threshold=0.25").status_code, 200)
             self.assertEqual(
                 client.get(f"/api/ml/transactions/{transaction_id}/explanation").status_code,

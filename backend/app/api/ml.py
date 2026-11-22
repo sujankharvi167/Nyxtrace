@@ -1,4 +1,4 @@
-from typing import Optional
+from typing import Literal, Optional
 
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, Field
@@ -32,10 +32,11 @@ async def dataset_readiness():
 @router.get("/status")
 async def model_status():
     state = ml_engine.get_status()
+    current_results = ml_engine.has_current_results()
     data = {
         **state,
-        "model_available": ml_engine.model_path.is_file(),
-        "predictions_available": ml_engine.predictions_path.is_file(),
+        "model_available": current_results and ml_engine.model_path.is_file(),
+        "predictions_available": current_results and ml_engine.predictions_path.is_file(),
     }
     return APIResponse(success=True, message=str(state.get("message", "Model status.")), data=data)
 
@@ -74,6 +75,17 @@ async def model_comparison():
     )
 
 
+@router.get("/summary")
+async def model_summary(
+    threshold: float = Query(default=DEFAULT_THRESHOLD, ge=0.0, le=1.0),
+):
+    return APIResponse(
+        success=True,
+        message="Current dataset and prediction summary.",
+        data=ml_engine.summary(threshold),
+    )
+
+
 async def _prediction_result(
     page: int,
     page_size: int,
@@ -81,6 +93,8 @@ async def _prediction_result(
     search: Optional[str],
     predicted_class: Optional[str],
     suspicious_only: bool,
+    sort_by: Optional[str],
+    sort_order: str,
 ):
     try:
         return await run_in_threadpool(
@@ -91,6 +105,8 @@ async def _prediction_result(
             search,
             predicted_class,
             suspicious_only,
+            sort_by,
+            sort_order,
         )
     except HTTPException:
         raise
@@ -104,9 +120,25 @@ async def predictions(
     page_size: int = Query(default=25, ge=1, le=100),
     threshold: float = Query(default=DEFAULT_THRESHOLD, ge=0.0, le=1.0),
     search: Optional[str] = Query(default=None, max_length=128),
-    predicted_class: Optional[str] = Query(default=None),
+    predicted_class: Optional[Literal["licit", "illicit"]] = Query(default=None),
+    sort_by: Optional[Literal[
+        "transaction_id",
+        "predicted_class",
+        "illicit_probability",
+        "confidence",
+    ]] = Query(default=None),
+    sort_order: Literal["asc", "desc"] = Query(default="asc"),
 ):
-    data = await _prediction_result(page, page_size, threshold, search, predicted_class, False)
+    data = await _prediction_result(
+        page,
+        page_size,
+        threshold,
+        search,
+        predicted_class,
+        False,
+        sort_by,
+        sort_order,
+    )
     return APIResponse(success=True, message="Paginated transaction predictions.", data=data)
 
 
@@ -116,8 +148,24 @@ async def suspicious_transactions(
     page_size: int = Query(default=25, ge=1, le=100),
     threshold: float = Query(default=DEFAULT_THRESHOLD, ge=0.0, le=1.0),
     search: Optional[str] = Query(default=None, max_length=128),
+    sort_by: Optional[Literal[
+        "transaction_id",
+        "predicted_class",
+        "illicit_probability",
+        "confidence",
+    ]] = Query(default=None),
+    sort_order: Literal["asc", "desc"] = Query(default="asc"),
 ):
-    data = await _prediction_result(page, page_size, threshold, search, "illicit", True)
+    data = await _prediction_result(
+        page,
+        page_size,
+        threshold,
+        search,
+        "illicit",
+        True,
+        sort_by,
+        sort_order,
+    )
     return APIResponse(success=True, message="Paginated model-flagged transactions.", data=data)
 
 

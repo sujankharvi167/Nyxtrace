@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import { Link, useLocation } from 'react-router-dom';
 import {
   LayoutDashboard,
@@ -11,15 +11,19 @@ import {
   ChevronRight,
   Activity,
   Zap,
+  BriefcaseBusiness,
 } from 'lucide-react';
 import { cn } from '@/utils';
 import { StatusBadge } from '@/components/ui';
+import { api } from '@/services/api';
+import type { GraphStatus, MLStatus } from '@/types';
 
 const NAV_ITEMS = [
   { label: 'Dashboard',            path: '/',           icon: LayoutDashboard },
   { label: 'Transaction Analysis', path: '/analysis',   icon: BarChart3       },
   { label: 'Money Flow',           path: '/money-flow', icon: GitFork         },
   { label: 'Risk Intelligence',    path: '/risk',       icon: ShieldAlert     },
+  { label: 'Investigation Cases',  path: '/cases',      icon: BriefcaseBusiness },
   { label: 'Reports',              path: '/reports',    icon: FileText        },
   { label: 'About NyxTrace',       path: '/about',      icon: Info            },
 ];
@@ -31,6 +35,38 @@ interface AppLayoutProps {
 export const AppLayout: React.FC<AppLayoutProps> = ({ children }) => {
   const location = useLocation();
   const [collapsed, setCollapsed] = useState(false);
+  const [mlStatus, setMlStatus] = useState<MLStatus | null>(null);
+  const [graphStatus, setGraphStatus] = useState<GraphStatus | null>(null);
+  const [backendAvailable, setBackendAvailable] = useState(false);
+
+  useEffect(() => {
+    let active = true;
+    const refresh = async () => {
+      try {
+        const [health, ml, graph] = await Promise.all([
+          api.health.check(),
+          api.ml.status(),
+          api.graph.status(),
+        ]);
+        if (!active) return;
+        setBackendAvailable(Boolean(health));
+        setMlStatus(ml.data ?? null);
+        setGraphStatus(graph.data ?? null);
+      } catch {
+        if (active) {
+          setBackendAvailable(false);
+          setMlStatus(null);
+          setGraphStatus(null);
+        }
+      }
+    };
+    void refresh();
+    const interval = window.setInterval(() => void refresh(), 5000);
+    return () => {
+      active = false;
+      window.clearInterval(interval);
+    };
+  }, []);
 
   return (
     <div className="flex h-screen overflow-hidden" style={{ backgroundColor: '#0a0e1a' }}>
@@ -119,15 +155,21 @@ export const AppLayout: React.FC<AppLayoutProps> = ({ children }) => {
             <div className="space-y-1.5">
               <div className="flex items-center justify-between">
                 <span className="text-xs text-slate-500">Backend API</span>
-                <StatusBadge status="operational" />
+                <StatusBadge status={backendAvailable ? 'operational' : 'inactive'} label={backendAvailable ? 'Operational' : 'Unavailable'} />
               </div>
               <div className="flex items-center justify-between">
                 <span className="text-xs text-slate-500">ML Pipeline</span>
-                <StatusBadge status="inactive" label="Not Trained" />
+                <StatusBadge
+                  status={mlStatus?.status === 'completed' ? 'operational' : 'inactive'}
+                  label={mlStatus?.status === 'completed' ? 'Ready' : mlStatus?.status === 'stale' ? 'Stale' : mlStatus?.status === 'running' ? 'Training' : 'Not Trained'}
+                />
               </div>
               <div className="flex items-center justify-between">
                 <span className="text-xs text-slate-500">Graph Engine</span>
-                <StatusBadge status="inactive" label="Not Built" />
+                <StatusBadge
+                  status={graphStatus?.status === 'ready' ? 'operational' : 'inactive'}
+                  label={graphStatus?.status === 'ready' ? 'Ready' : graphStatus?.status === 'stale' ? 'Stale' : graphStatus?.status === 'running' ? 'Building' : 'Not Built'}
+                />
               </div>
             </div>
           </div>

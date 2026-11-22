@@ -36,6 +36,24 @@
 }
 
 @layer components {
+  .report-input {
+    width: 100%;
+    border: 1px solid #1e2d4a;
+    background-color: #141d35;
+    color: #e2e8f0;
+    border-radius: 0.5rem;
+    padding: 0.625rem 0.75rem;
+    font-size: 0.75rem;
+  }
+  .case-input {
+    width: 100%;
+    border: 1px solid #1e2d4a;
+    background-color: #141d35;
+    color: #e2e8f0;
+    border-radius: 0.5rem;
+    padding: 0.625rem 0.75rem;
+    font-size: 0.75rem;
+  }
   .card {
     background-color: #141d35;
     border: 1px solid #1e2d4a;

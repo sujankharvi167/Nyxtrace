@@ -18,7 +18,7 @@ import {
   XAxis,
   YAxis,
 } from 'recharts';
-import { api } from '@/services/api';
+import { APIError, api } from '@/services/api';
 import type {
   APIResponse,
   MLEvaluation,
@@ -29,7 +29,8 @@ import type {
 } from '@/types';
 
 const number = (value: number | undefined) => (value ?? 0).toLocaleString();
-const percent = (value: number | undefined) => `${((value ?? 0) * 100).toFixed(1)}%`;
+const percent = (value: number | null | undefined) =>
+  typeof value === 'number' && Number.isFinite(value) ? `${(value * 100).toFixed(1)}%` : '—';
 
 export const MLIntelligencePanel: React.FC = () => {
   const [readiness, setReadiness] = useState<MLReadiness | null>(null);
@@ -41,7 +42,10 @@ export const MLIntelligencePanel: React.FC = () => {
   const [search, setSearch] = useState('');
   const [page, setPage] = useState(1);
   const [suspiciousOnly, setSuspiciousOnly] = useState(true);
+  const [sortBy, setSortBy] = useState<'transaction_id' | 'predicted_class' | 'illicit_probability' | 'confidence'>('illicit_probability');
+  const [sortOrder, setSortOrder] = useState<'asc' | 'desc'>('desc');
   const [loading, setLoading] = useState(true);
+  const [predictionsLoading, setPredictionsLoading] = useState(false);
   const [training, setTraining] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -50,11 +54,16 @@ export const MLIntelligencePanel: React.FC = () => {
       const response = await api.ml.evaluation();
       setEvaluation(response.data ?? null);
     } catch (err) {
-      if (err instanceof Error && !err.message.includes('409')) setError(err.message);
+      if (err instanceof APIError && err.status === 409) {
+        setEvaluation(null);
+      } else if (err instanceof Error) {
+        setError(err.message);
+      }
     }
   }, []);
 
   const loadPredictions = useCallback(async () => {
+    setPredictionsLoading(true);
     try {
       const response = await api.ml.predictions({
         page,
@@ -62,12 +71,20 @@ export const MLIntelligencePanel: React.FC = () => {
         threshold,
         search,
         suspiciousOnly,
+        sortBy,
+        sortOrder,
       });
       setPredictions(response.data ?? null);
     } catch (err) {
-      if (err instanceof Error && !err.message.includes('409')) setError(err.message);
+      if (err instanceof APIError && err.status === 409) {
+        setPredictions(null);
+      } else if (err instanceof Error) {
+        setError(err.message);
+      }
+    } finally {
+      setPredictionsLoading(false);
     }
-  }, [page, search, suspiciousOnly, threshold]);
+  }, [page, search, sortBy, sortOrder, suspiciousOnly, threshold]);
 
   const loadState = useCallback(async () => {
     try {
@@ -89,6 +106,17 @@ export const MLIntelligencePanel: React.FC = () => {
   }, [loadState]);
 
   useEffect(() => {
+    const refreshDatasetState = () => {
+      setEvaluation(null);
+      setPredictions(null);
+      setExplanation(null);
+      void loadState();
+    };
+    window.addEventListener('nyxtrace:dataset-updated', refreshDatasetState);
+    return () => window.removeEventListener('nyxtrace:dataset-updated', refreshDatasetState);
+  }, [loadState]);
+
+  useEffect(() => {
     if (status?.status !== 'running') return undefined;
     const timer = window.setInterval(() => {
       void loadState();
@@ -105,7 +133,19 @@ export const MLIntelligencePanel: React.FC = () => {
 
   useEffect(() => {
     setPage(1);
-  }, [search, threshold, suspiciousOnly]);
+  }, [search, sortBy, sortOrder, threshold, suspiciousOnly]);
+
+  const changeSort = (
+    field: 'transaction_id' | 'predicted_class' | 'illicit_probability' | 'confidence',
+  ) => {
+    if (sortBy === field) {
+      setSortOrder(current => current === 'asc' ? 'desc' : 'asc');
+    } else {
+      setSortBy(field);
+      setSortOrder(field === 'transaction_id' || field === 'predicted_class' ? 'asc' : 'desc');
+    }
+    setPage(1);
+  };
 
   const startTraining = async () => {
     setError(null);
@@ -183,7 +223,9 @@ export const MLIntelligencePanel: React.FC = () => {
 
         <div className="mt-4 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
           <div className="min-w-0">
-            <p className="text-xs text-slate-300">{status?.message ?? 'Ready to train Logistic Regression and Random Forest.'}</p>
+            <p className={`text-xs ${status?.status === 'stale' ? 'text-amber-300' : 'text-slate-300'}`}>
+              {status?.message ?? 'Ready to train Logistic Regression and Random Forest.'}
+            </p>
             {status?.error && <p className="text-xs text-red-300 mt-1">{status.error}</p>}
             {status?.best_model && <p className="text-xs text-emerald-300 mt-1">Selected: {status.best_model}</p>}
           </div>
@@ -221,8 +263,18 @@ export const MLIntelligencePanel: React.FC = () => {
       {!evaluation ? (
         <div className="card p-8 text-center">
           {status?.status === 'running' ? <Loader2 className="w-6 h-6 animate-spin text-blue-400 mx-auto" /> : <BrainCircuit className="w-6 h-6 text-slate-600 mx-auto" />}
-          <p className="text-sm text-slate-300 mt-3">{status?.status === 'running' ? 'Training and evaluating models…' : 'No completed model evaluation yet'}</p>
-          <p className="text-xs text-slate-500 mt-1">Training outputs, metrics, and predictions will appear here.</p>
+          <p className="text-sm text-slate-300 mt-3">
+            {status?.status === 'running'
+              ? 'Training and evaluating models…'
+              : status?.status === 'stale'
+                ? 'Saved results are stale'
+                : 'No completed model evaluation yet'}
+          </p>
+          <p className="text-xs text-slate-500 mt-1">
+            {status?.status === 'stale'
+              ? 'The latest dataset differs from the dataset used by the saved model. Retrain to refresh results.'
+              : 'Training outputs, metrics, and predictions will appear here.'}
+          </p>
         </div>
       ) : (
         <>
@@ -261,6 +313,9 @@ export const MLIntelligencePanel: React.FC = () => {
                 Chronological split: {evaluation.dataset.split_strategy.replace(/_/g, ' ')}
                 {evaluation.dataset.time_column && ` at ${evaluation.dataset.time_column} ${evaluation.dataset.time_cutoff}`}.
               </p>
+              {evaluation.metrics.unavailable_metric_reason && (
+                <p className="text-xs text-amber-300 mt-2">{evaluation.metrics.unavailable_metric_reason}</p>
+              )}
             </div>
 
             <div className="card p-5 space-y-4">
@@ -335,9 +390,10 @@ export const MLIntelligencePanel: React.FC = () => {
                 <table className="w-full text-xs">
                   <thead>
                     <tr className="text-slate-500" style={{ borderBottom: '1px solid #263354' }}>
-                      <th className="text-left p-2">Transaction ID</th>
-                      <th className="text-left p-2">Prediction</th>
-                      <th className="text-right p-2">Illicit probability</th>
+                      <SortableHeader label="Transaction ID" field="transaction_id" sortBy={sortBy} sortOrder={sortOrder} onSort={changeSort} align="left" />
+                      <SortableHeader label="Prediction" field="predicted_class" sortBy={sortBy} sortOrder={sortOrder} onSort={changeSort} align="left" />
+                      <SortableHeader label="Illicit probability" field="illicit_probability" sortBy={sortBy} sortOrder={sortOrder} onSort={changeSort} align="right" />
+                      <SortableHeader label="Confidence" field="confidence" sortBy={sortBy} sortOrder={sortOrder} onSort={changeSort} align="right" />
                       <th className="text-left p-2">Model</th>
                       <th className="text-left p-2">Ground truth</th>
                     </tr>
@@ -356,13 +412,15 @@ export const MLIntelligencePanel: React.FC = () => {
                           {item.predicted_class}
                         </td>
                         <td className="p-2 text-right text-slate-300">{percent(item.illicit_probability)}</td>
+                        <td className="p-2 text-right text-slate-300">{percent(item.confidence)}</td>
                         <td className="p-2 text-slate-400">{item.selected_model}</td>
                         <td className="p-2 capitalize text-slate-500">{item.ground_truth_label}</td>
                       </tr>
                     ))}
-                    {!predictions?.items.length && (
-                      <tr><td colSpan={5} className="p-6 text-center text-slate-500">No predictions match these filters.</td></tr>
+                    {!predictionsLoading && !predictions?.items.length && (
+                      <tr><td colSpan={6} className="p-6 text-center text-slate-500">No predictions match these filters.</td></tr>
                     )}
+                    {predictionsLoading && <tr><td colSpan={6} className="p-6 text-center text-slate-500">Loading predictions…</td></tr>}
                   </tbody>
                 </table>
               </div>
@@ -406,6 +464,36 @@ export const MLIntelligencePanel: React.FC = () => {
       )}
     </section>
   );
+
+  function SortableHeader({
+    label,
+    field,
+    sortBy,
+    sortOrder,
+    onSort,
+    align,
+  }: {
+    label: string;
+    field: 'transaction_id' | 'predicted_class' | 'illicit_probability' | 'confidence';
+    sortBy: 'transaction_id' | 'predicted_class' | 'illicit_probability' | 'confidence';
+    sortOrder: 'asc' | 'desc';
+    onSort: (field: 'transaction_id' | 'predicted_class' | 'illicit_probability' | 'confidence') => void;
+    align: 'left' | 'right';
+  }) {
+    return (
+      <th className={`p-2 ${align === 'right' ? 'text-right' : 'text-left'}`}>
+        <button
+          type="button"
+          className="inline-flex items-center gap-1 hover:text-slate-300"
+          onClick={() => onSort(field)}
+          aria-label={`Sort by ${label}`}
+        >
+          {label}
+          {sortBy === field && <span aria-hidden="true">{sortOrder === 'asc' ? '↑' : '↓'}</span>}
+        </button>
+      </th>
+    );
+  }
 };
 
 const SummaryCell: React.FC<{ label: string; value: string; tone?: 'green' | 'amber' | 'muted' }> = ({ label, value, tone = 'muted' }) => (

@@ -113,13 +113,13 @@ pip install -r requirements.txt
 # Edit .env if you need to change ports or CORS origins
 
 # Start the development server
-uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
+uvicorn app.main:app --reload --host 0.0.0.0 --port 8001
 ```
 
 The API will be available at:
-- **API Base**: http://localhost:8000
-- **Swagger Docs**: http://localhost:8000/api/docs
-- **ReDoc**: http://localhost:8000/api/redoc
+- **API Base**: http://localhost:8001
+- **Swagger Docs**: http://localhost:8001/api/docs
+- **ReDoc**: http://localhost:8001/api/redoc
 
 ---
 
@@ -140,7 +140,7 @@ pnpm dev
 
 The frontend will be available at: **http://localhost:5173**
 
-The Vite dev server proxies all `/api` requests to `http://localhost:8000`, so both services must be running simultaneously for full functionality.
+The Vite dev server proxies all `/api` requests to `http://localhost:8001`, so both services must be running simultaneously for full functionality. Set `NYXTRACE_API_TARGET` in `frontend/.env` to override the proxy target.
 
 ---
 
@@ -160,6 +160,7 @@ The Vite dev server proxies all `/api` requests to `http://localhost:8000`, so b
 | POST | `/api/ml/train` | Compare, evaluate, and persist ML models | ✅ Stage 3 |
 | GET | `/api/ml/evaluation` | Held-out model metrics | ✅ Stage 3 |
 | GET | `/api/ml/models` | Model comparison results | ✅ Stage 3 |
+| GET | `/api/ml/summary` | Dataset and prediction distribution statistics | ✅ Stage 3 |
 | GET | `/api/ml/predictions` | Paginated transaction predictions | ✅ Stage 3 |
 | GET | `/api/ml/suspicious` | Paginated predictions above illicit threshold | ✅ Stage 3 |
 | GET | `/api/ml/feature-importance` | Selected-model global feature importance | ✅ Stage 3 |
@@ -174,7 +175,9 @@ The Vite dev server proxies all `/api` requests to `http://localhost:8000`, so b
 
 Open **Transaction Analysis**, upload the Elliptic++ feature and class CSVs, then select **Train & evaluate**. Training compares class-weighted Logistic Regression and Random Forest models. When a reliable time-step field is present, the holdout is chronological; otherwise a reproducible stratified split is used. Only licit and illicit labels are supervised targets; unknown labels are excluded from training/evaluation and retained as ground truth for transaction predictions.
 
-Training runs in the background; the page polls its progress and then displays held-out metrics, model comparison, confusion matrix, global feature importance, paginated predictions, and local feature-ablation explanations. The explanation is a sensitivity estimate, not a causal account. The selected model, preprocessing medians, feature order, model configurations, evaluation results, and batched predictions are stored under `backend/data/ml/` (ignored by Git). The Risk Intelligence, graph, and investigation stages remain outside this implementation.
+Training runs in the background; the page polls its progress and displays held-out metrics, model comparison, confusion matrix, global feature importance, paginated/sortable predictions, and local feature-ablation explanations. The model is selected by held-out illicit-class F1, with PR-AUC as the tie-breaker. ROC-AUC and PR-AUC are unavailable when the held-out split contains only one class. The explanation is a sensitivity estimate, not a causal account. The selected model, preprocessing medians, feature order, model configurations, evaluation results, and batched predictions are stored under `backend/data/ml/` (ignored by Git); artifacts from a prior dataset are not served as current results. The Risk Intelligence, graph, and investigation stages remain outside this implementation.
+
+Uploads accept up to three CSV files, with a 750 MB individual-file limit and an 800 MB combined limit. Files are streamed to disk and preprocessed in chunks; the frontend reports bytes sent separately from backend validation/processing. The Vite proxy allows two-hour uploads and targets port 8001 by default.
 
 Run the backend tests from `backend/` with `python -m unittest discover -s tests -p "test_*.py"` and build the frontend from `frontend/` with `npm run build`.
 
